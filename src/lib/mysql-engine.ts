@@ -29,11 +29,20 @@ export interface SQLLogEntry {
   status: 'SUCCESS' | 'ERROR';
 }
 
+export interface SQLStatementSummary {
+  statement: string;
+  status: string;
+  rowsAffected: number;
+}
+
 export interface SQLQueryResult {
   columns: string[];
   rows: Record<string, any>[];
   rowCount: number;
   executionTimeMs: number;
+  affectedRows?: number;
+  inTransaction?: boolean;
+  statementSummaries?: SQLStatementSummary[];
   query: string;
   error?: string;
 }
@@ -51,6 +60,7 @@ class MySQLEngine {
   private listeners: (() => void)[] = [];
   private isCloudSynced: boolean = false;
   private isInitialized: boolean = false;
+  private txActive: boolean = false;
 
   constructor() {
     this.logQuery('SET NAMES utf8mb4; SET FOREIGN_KEY_CHECKS = 1;', 1, 0);
@@ -195,6 +205,26 @@ class MySQLEngine {
       return this.jobApplications.filter(a => a.student_id === studentId);
     }
     return [...this.jobApplications];
+  }
+
+  // Sync authenticated or newly created user & profile
+  public upsertUserAndProfile(user: UserRecord, profile: StudentProfileRecord | null): void {
+    const existingUserIdx = this.users.findIndex(u => u.id === user.id);
+    if (existingUserIdx >= 0) {
+      this.users[existingUserIdx] = { ...this.users[existingUserIdx], ...user };
+    } else {
+      this.users.push(user);
+    }
+
+    if (profile) {
+      const existingProfIdx = this.studentProfiles.findIndex(p => p.id === profile.id);
+      if (existingProfIdx >= 0) {
+        this.studentProfiles[existingProfIdx] = { ...this.studentProfiles[existingProfIdx], ...profile };
+      } else {
+        this.studentProfiles.push(profile);
+      }
+    }
+    this.notify();
   }
 
   // Mutations with MySQL Logging
@@ -372,16 +402,65 @@ class MySQLEngine {
     return this.createJob(jobData, requiredSkills);
   }
 
-  // Live SQL Query Evaluator for the interactive Studio
+  // Live SQL Query Evaluator for the interactive Studio (offline fallback)
   public executeQuery(sqlQuery: string): SQLQueryResult {
     const start = performance.now();
-    const trimmed = sqlQuery.trim();
+    const statements = sqlQuery
+      .split(';')
+      .map(s => s.trim())
+      .filter(Boolean);
+    const trimmed = statements.length > 0 ? statements[statements.length - 1] : sqlQuery.trim();
     const upper = trimmed.toUpperCase();
 
     try {
+      if (upper.startsWith('START TRANSACTION') || upper === 'BEGIN') {
+        this.txActive = true;
+        const time = Math.max(1, Math.round(performance.now() - start));
+        this.logQuery(sqlQuery, time, 0);
+        return {
+          columns: ['status', 'transaction_state'],
+          rows: [{ status: 'OK', transaction_state: 'Transaction started (offline fallback)' }],
+          rowCount: 1,
+          affectedRows: 0,
+          inTransaction: this.txActive,
+          executionTimeMs: time,
+          query: sqlQuery
+        };
+      }
+
+      if (upper.startsWith('COMMIT')) {
+        this.txActive = false;
+        const time = Math.max(1, Math.round(performance.now() - start));
+        this.logQuery(sqlQuery, time, 0);
+        return {
+          columns: ['status', 'transaction_state'],
+          rows: [{ status: 'COMMITTED', transaction_state: 'Autocommit restored' }],
+          rowCount: 1,
+          affectedRows: 0,
+          inTransaction: this.txActive,
+          executionTimeMs: time,
+          query: sqlQuery
+        };
+      }
+
+      if (upper.startsWith('ROLLBACK')) {
+        this.txActive = false;
+        const time = Math.max(1, Math.round(performance.now() - start));
+        this.logQuery(sqlQuery, time, 0);
+        return {
+          columns: ['status', 'transaction_state'],
+          rows: [{ status: 'ROLLED BACK', transaction_state: 'Autocommit restored' }],
+          rowCount: 1,
+          affectedRows: 0,
+          inTransaction: this.txActive,
+          executionTimeMs: time,
+          query: sqlQuery
+        };
+      }
+
       // 1. SHOW TABLES
       if (upper.startsWith('SHOW TABLES')) {
-        const time = Math.round(performance.now() - start);
+        const time = Math.max(1, Math.round(performance.now() - start));
         this.logQuery(trimmed, time, 8);
         return {
           columns: ['Tables_in_skillbridge_db', 'Engine', 'Rows_Estimate'],
@@ -396,6 +475,8 @@ class MySQLEngine {
             { Tables_in_skillbridge_db: 'job_applications', Engine: 'InnoDB', Rows_Estimate: this.jobApplications.length }
           ],
           rowCount: 8,
+          affectedRows: 0,
+          inTransaction: this.txActive,
           executionTimeMs: time,
           query: trimmed
         };
@@ -405,7 +486,7 @@ class MySQLEngine {
       if (upper.startsWith('DESCRIBE') || upper.startsWith('DESC')) {
         const parts = trimmed.split(/\s+/);
         const tableName = (parts[1] || '').replace(/;$/, '').toLowerCase();
-        const time = Math.round(performance.now() - start);
+        const time = Math.max(1, Math.round(performance.now() - start));
         this.logQuery(trimmed, time, 1);
 
         const schemaMeta: Record<string, { Field: string; Type: string; Null: string; Key: string; Default: any }[]> = {
@@ -458,6 +539,8 @@ class MySQLEngine {
           columns: ['Field', 'Type', 'Null', 'Key', 'Default'],
           rows,
           rowCount: rows.length,
+          affectedRows: 0,
+          inTransaction: this.txActive,
           executionTimeMs: time,
           query: trimmed
         };
@@ -530,18 +613,15 @@ class MySQLEngine {
             };
           });
         } else {
-          // Default joined recommendation query
           rows = this.jobPostings.slice(0, 5).map(j => ({
             job_id: j.id,
             title: j.title,
             company: j.company,
             work_type: j.work_type,
-            sample_match_rate: '88.5%',
             department: j.department
           }));
         }
 
-        // Apply simple LIMIT if present
         const limitMatch = trimmed.match(/LIMIT\s+(\d+)/i);
         if (limitMatch && limitMatch[1]) {
           const limit = parseInt(limitMatch[1], 10);
@@ -556,28 +636,33 @@ class MySQLEngine {
           columns,
           rows,
           rowCount: rows.length,
+          affectedRows: 0,
+          inTransaction: this.txActive,
           executionTimeMs: time,
           query: trimmed
         };
       }
 
-      // Default fallback
-      const time = Math.round(performance.now() - start);
+      const time = Math.max(1, Math.round(performance.now() - start));
       this.logQuery(trimmed, time, 1);
       return {
         columns: ['status', 'message'],
         rows: [{ status: 'OK', message: `Query executed successfully (${trimmed.substring(0, 30)}...)` }],
         rowCount: 1,
+        affectedRows: 1,
+        inTransaction: this.txActive,
         executionTimeMs: time,
         query: trimmed
       };
     } catch (err: any) {
-      const time = Math.round(performance.now() - start);
+      const time = Math.max(1, Math.round(performance.now() - start));
       this.logQuery(trimmed, time, 0, 'ERROR');
       return {
         columns: ['error_code', 'error_message'],
         rows: [{ error_code: 'ER_SYNTAX_ERROR', error_message: err.message || 'Error executing query' }],
         rowCount: 0,
+        affectedRows: 0,
+        inTransaction: this.txActive,
         executionTimeMs: time,
         query: trimmed,
         error: err.message

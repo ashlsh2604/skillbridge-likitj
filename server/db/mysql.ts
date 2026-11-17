@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import mysql, { Pool, PoolConnection } from 'mysql2/promise';
 import {
   INITIAL_USERS,
@@ -8,6 +9,65 @@ import {
   INITIAL_JOB_REQUIRED_SKILLS,
   INITIAL_JOB_APPLICATIONS
 } from '../../src/data/initial-mysql-data';
+
+const AUTH_SECRET = process.env.AUTH_SECRET || process.env.APP_URL || 'skillbridge-mysql-session-secret-2026';
+
+function hashPassword(password: string): string {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const derived = crypto.scryptSync(password, salt, 64).toString('hex');
+  return `${salt}:${derived}`;
+}
+
+function verifyPassword(password: string, storedHash?: string): boolean {
+  if (!storedHash || !storedHash.includes(':')) return false;
+  const [salt, keyHex] = storedHash.split(':');
+  if (!salt || !keyHex) return false;
+  try {
+    const derived = crypto.scryptSync(password, salt, 64);
+    const keyBuf = Buffer.from(keyHex, 'hex');
+    if (derived.length !== keyBuf.length) return false;
+    return crypto.timingSafeEqual(derived, keyBuf);
+  } catch {
+    return false;
+  }
+}
+
+function createSessionToken(user: { id: number; email: string; role: string }): string {
+  const payload = {
+    userId: user.id,
+    email: user.email,
+    role: user.role,
+    exp: Date.now() + 7 * 24 * 60 * 60 * 1000
+  };
+  const encoded = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const sig = crypto.createHmac('sha256', AUTH_SECRET).update(encoded).digest('base64url');
+  return `${encoded}.${sig}`;
+}
+
+function verifySessionToken(token: string): { userId: number; email: string; role: string } | null {
+  if (!token || !token.includes('.')) return null;
+  const [encoded, sig] = token.split('.');
+  if (!encoded || !sig) return null;
+  try {
+    const expectedSig = crypto.createHmac('sha256', AUTH_SECRET).update(encoded).digest('base64url');
+    const sigBuf = Buffer.from(sig);
+    const expectedBuf = Buffer.from(expectedSig);
+    if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) {
+      return null;
+    }
+    const payload = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
+    if (!payload.userId || !payload.exp || Date.now() > payload.exp) {
+      return null;
+    }
+    return {
+      userId: Number(payload.userId),
+      email: String(payload.email),
+      role: String(payload.role)
+    };
+  } catch {
+    return null;
+  }
+}
 
 export interface MySQLConfig {
   host: string;
@@ -38,6 +98,7 @@ export interface MySQLStatus {
   error?: string;
   tableCounts: Record<string, number>;
   totalQueries: number;
+  inTransaction: boolean;
 }
 
 // In-memory relational storage fallback if external MySQL server is unreachable
@@ -54,10 +115,13 @@ interface InMemStore {
 
 class MySQLBackendService {
   private pool: Pool | null = null;
+  private activeTxConn: PoolConnection | null = null;
   private isConnected = false;
   private currentConfig: MySQLConfig;
   private logs: BackendSQLLog[] = [];
   private inMemStore: InMemStore;
+  private txSnapshot: InMemStore | null = null;
+  private savepoints: Map<string, InMemStore> = new Map();
   private lastPingMs = 0;
   private lastError: string | undefined = undefined;
 
@@ -71,9 +135,13 @@ class MySQLBackendService {
       ssl: process.env.MYSQL_SSL === 'true'
     };
 
-    // Deep copy initial data into in-memory store
+    // Deep copy initial data into in-memory store with default hashed passwords for seeded accounts
+    const defaultSeededHash = hashPassword('SkillBridge2026!');
     this.inMemStore = {
-      users: JSON.parse(JSON.stringify(INITIAL_USERS)),
+      users: JSON.parse(JSON.stringify(INITIAL_USERS)).map((u: any) => ({
+        ...u,
+        password_hash: u.password_hash || defaultSeededHash
+      })),
       student_profiles: JSON.parse(JSON.stringify(INITIAL_STUDENT_PROFILES)),
       skills: JSON.parse(JSON.stringify(INITIAL_SKILLS)),
       student_skills: JSON.parse(JSON.stringify(INITIAL_STUDENT_SKILLS)),
@@ -175,6 +243,7 @@ class MySQLBackendService {
         `CREATE TABLE IF NOT EXISTS users (
           id INT AUTO_INCREMENT PRIMARY KEY,
           email VARCHAR(255) NOT NULL UNIQUE,
+          password_hash VARCHAR(255),
           full_name VARCHAR(150) NOT NULL,
           role ENUM('student', 'recruiter', 'admin') DEFAULT 'student',
           avatar_url VARCHAR(500),
@@ -263,6 +332,14 @@ class MySQLBackendService {
       for (const statement of ddlStatements) {
         await this.pool.query(statement);
       }
+      // Ensure password_hash column exists on pre-existing users tables
+      try {
+        await this.pool.query('ALTER TABLE users ADD COLUMN password_hash VARCHAR(255) AFTER email;');
+      } catch (alterErr: any) {
+        if (!String(alterErr?.message || '').includes('Duplicate column')) {
+          console.warn('[MySQL Backend] Column migration note:', alterErr.message);
+        }
+      }
       console.log('[MySQL Backend] Relational InnoDB schema confirmed on MySQL server');
     } catch (err: any) {
       console.error('[MySQL Backend] Error executing schema creation on MySQL:', err.message);
@@ -285,8 +362,8 @@ class MySQLBackendService {
       // Insert users
       for (const u of this.inMemStore.users) {
         await this.pool.query(
-          'INSERT INTO users (id, email, full_name, role, avatar_url, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-          [u.id, u.email, u.full_name, u.role, u.avatar_url || null, u.created_at || new Date()]
+          'INSERT INTO users (id, email, password_hash, full_name, role, avatar_url, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          [u.id, u.email, u.password_hash || hashPassword('SkillBridge2026!'), u.full_name, u.role, u.avatar_url || null, u.created_at || new Date()]
         );
       }
 
@@ -347,8 +424,28 @@ class MySQLBackendService {
   }
 
   public async reseedAll(): Promise<{ success: boolean; message: string }> {
+    if (this.activeTxConn) {
+      try {
+        await this.activeTxConn.rollback();
+      } catch {
+        // ignore rollback cleanup errors
+      }
+      try {
+        this.activeTxConn.release();
+      } catch {
+        // ignore release errors
+      }
+      this.activeTxConn = null;
+    }
+    this.txSnapshot = null;
+    this.savepoints.clear();
+
+    const defaultSeededHash = hashPassword('SkillBridge2026!');
     this.inMemStore = {
-      users: JSON.parse(JSON.stringify(INITIAL_USERS)),
+      users: JSON.parse(JSON.stringify(INITIAL_USERS)).map((u: any) => ({
+        ...u,
+        password_hash: u.password_hash || defaultSeededHash
+      })),
       student_profiles: JSON.parse(JSON.stringify(INITIAL_STUDENT_PROFILES)),
       skills: JSON.parse(JSON.stringify(INITIAL_SKILLS)),
       student_skills: JSON.parse(JSON.stringify(INITIAL_STUDENT_SKILLS)),
@@ -379,60 +476,307 @@ class MySQLBackendService {
     return { success: true, message: 'Database reset and re-seeded successfully' };
   }
 
-  // Live SQL Query Executor
+  private splitSQLStatements(sqlString: string): string[] {
+    const statements: string[] = [];
+    let current = '';
+    let inSingle = false;
+    let inDouble = false;
+    let inBacktick = false;
+
+    const lines = sqlString.split(/\r?\n/);
+    const cleanedLines = lines.map(line => {
+      // Strip -- line comments outside quotes simply when line starts with --
+      const trimmedLine = line.trim();
+      if (trimmedLine.startsWith('--')) return '';
+      return line;
+    });
+    const text = cleanedLines.join('\n');
+
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      const prev = i > 0 ? text[i - 1] : '';
+
+      if (ch === "'" && !inDouble && !inBacktick && prev !== '\\') {
+        inSingle = !inSingle;
+      } else if (ch === '"' && !inSingle && !inBacktick && prev !== '\\') {
+        inDouble = !inDouble;
+      } else if (ch === '`' && !inSingle && !inDouble) {
+        inBacktick = !inBacktick;
+      }
+
+      if (ch === ';' && !inSingle && !inDouble && !inBacktick) {
+        if (current.trim()) statements.push(current.trim());
+        current = '';
+      } else {
+        current += ch;
+      }
+    }
+
+    if (current.trim()) {
+      statements.push(current.trim());
+    }
+    return statements;
+  }
+
+  private cloneStore(store: InMemStore): InMemStore {
+    return JSON.parse(JSON.stringify(store));
+  }
+
+  // Live SQL Query Executor (supports single & multi-statement scripts + transactions)
   public async executeRawSQL(sqlString: string): Promise<{
     columns: string[];
     rows: any[];
     executionTimeMs: number;
     affectedRows: number;
+    inTransaction: boolean;
+    statementSummaries?: { statement: string; status: string; rowsAffected: number }[];
     error?: string;
   }> {
-    const trimmed = sqlString.trim().replace(/;+$/, '');
-    const start = Date.now();
-
-    if (this.isConnected && this.pool) {
-      try {
-        const [result, fields]: any = await this.pool.query(trimmed);
-        const duration = Date.now() - start;
-
-        let columns: string[] = [];
-        let rows: any[] = [];
-        let affected = 0;
-
-        if (Array.isArray(result)) {
-          rows = result;
-          if (fields && fields.length > 0) {
-            columns = fields.map((f: any) => f.name);
-          } else if (rows.length > 0) {
-            columns = Object.keys(rows[0]);
-          }
-        } else if (result && typeof result === 'object') {
-          affected = result.affectedRows || 0;
-          columns = ['result', 'affectedRows', 'insertId'];
-          rows = [{
-            result: 'Query OK',
-            affectedRows: result.affectedRows,
-            insertId: result.insertId
-          }];
-        }
-
-        this.logQuery(trimmed, duration, affected || rows.length, 'mysql-server');
-        return { columns, rows, executionTimeMs: duration, affectedRows: affected };
-      } catch (err: any) {
-        const duration = Date.now() - start;
-        this.logQuery(`-- ERROR: ${err.message}\n${trimmed}`, duration, 0, 'mysql-server');
-        return {
-          columns: ['error'],
-          rows: [{ error: err.message }],
-          executionTimeMs: duration,
-          affectedRows: 0,
-          error: err.message
-        };
-      }
+    const statements = this.splitSQLStatements(sqlString);
+    if (statements.length === 0) {
+      return {
+        columns: ['Status'],
+        rows: [{ Status: 'No SQL statements to execute.' }],
+        executionTimeMs: 0,
+        affectedRows: 0,
+        inTransaction: Boolean(this.activeTxConn || this.txSnapshot)
+      };
     }
 
-    // In-memory SQL simulator for preview sandbox
-    return this.executeInMemorySQL(trimmed);
+    const totalStart = Date.now();
+    const summaries: { statement: string; status: string; rowsAffected: number }[] = [];
+    let lastResult: { columns: string[]; rows: any[]; affectedRows: number; error?: string } = {
+      columns: ['Status'],
+      rows: [],
+      affectedRows: 0
+    };
+
+    if (this.isConnected && this.pool) {
+      for (const stmt of statements) {
+        const stmtStart = Date.now();
+        const upper = stmt.toUpperCase().trim();
+
+        try {
+          if (upper === 'START TRANSACTION' || upper === 'BEGIN' || upper === 'BEGIN WORK') {
+            if (!this.activeTxConn) {
+              this.activeTxConn = await this.pool.getConnection();
+            }
+            await this.activeTxConn.beginTransaction();
+            const dur = Date.now() - stmtStart;
+            this.logQuery(stmt, dur, 0, 'mysql-server');
+            summaries.push({ statement: stmt, status: 'Transaction started', rowsAffected: 0 });
+            lastResult = {
+              columns: ['Status', 'Transaction_State'],
+              rows: [{ Status: 'Query OK', Transaction_State: 'ACTIVE (Uncommitted)' }],
+              affectedRows: 0
+            };
+            continue;
+          }
+
+          if (upper === 'COMMIT' || upper === 'COMMIT WORK') {
+            if (this.activeTxConn) {
+              await this.activeTxConn.commit();
+              this.activeTxConn.release();
+              this.activeTxConn = null;
+            } else {
+              await this.pool.query('COMMIT');
+            }
+            const dur = Date.now() - stmtStart;
+            this.logQuery(stmt, dur, 0, 'mysql-server');
+            summaries.push({ statement: stmt, status: 'Committed', rowsAffected: 0 });
+            lastResult = {
+              columns: ['Status', 'Transaction_State'],
+              rows: [{ Status: 'Transaction committed successfully', Transaction_State: 'AUTOCOMMIT' }],
+              affectedRows: 0
+            };
+            continue;
+          }
+
+          if (upper === 'ROLLBACK' || upper === 'ROLLBACK WORK') {
+            if (this.activeTxConn) {
+              await this.activeTxConn.rollback();
+              this.activeTxConn.release();
+              this.activeTxConn = null;
+            } else {
+              await this.pool.query('ROLLBACK');
+            }
+            const dur = Date.now() - stmtStart;
+            this.logQuery(stmt, dur, 0, 'mysql-server');
+            summaries.push({ statement: stmt, status: 'Rolled back', rowsAffected: 0 });
+            lastResult = {
+              columns: ['Status', 'Transaction_State'],
+              rows: [{ Status: 'Transaction rolled back — changes reverted', Transaction_State: 'AUTOCOMMIT' }],
+              affectedRows: 0
+            };
+            continue;
+          }
+
+          const executor = this.activeTxConn || this.pool;
+          const [result, fields]: any = await executor.query(stmt);
+          const duration = Date.now() - stmtStart;
+
+          let columns: string[] = [];
+          let rows: any[] = [];
+          let affected = 0;
+
+          if (Array.isArray(result)) {
+            rows = result;
+            if (fields && fields.length > 0) {
+              columns = fields.map((f: any) => f.name);
+            } else if (rows.length > 0) {
+              columns = Object.keys(rows[0]);
+            } else {
+              columns = ['result'];
+            }
+            summaries.push({ statement: stmt, status: `${rows.length} row(s)`, rowsAffected: rows.length });
+          } else if (result && typeof result === 'object') {
+            affected = result.affectedRows || 0;
+            columns = ['result', 'affectedRows', 'insertId'];
+            rows = [{
+              result: 'Query OK',
+              affectedRows: result.affectedRows || 0,
+              insertId: result.insertId || 0
+            }];
+            summaries.push({ statement: stmt, status: `Query OK (${affected} affected)`, rowsAffected: affected });
+          }
+
+          this.logQuery(stmt, duration, affected || rows.length, 'mysql-server');
+          lastResult = { columns, rows, affectedRows: affected || rows.length };
+        } catch (err: any) {
+          const duration = Date.now() - stmtStart;
+          this.logQuery(`-- ERROR: ${err.message}\n${stmt}`, duration, 0, 'mysql-server');
+          return {
+            columns: ['error'],
+            rows: [{ error: err.message }],
+            executionTimeMs: Date.now() - totalStart,
+            affectedRows: 0,
+            inTransaction: Boolean(this.activeTxConn),
+            statementSummaries: [...summaries, { statement: stmt, status: `ERROR: ${err.message}`, rowsAffected: 0 }],
+            error: err.message
+          };
+        }
+      }
+
+      return {
+        ...lastResult,
+        executionTimeMs: Math.max(1, Date.now() - totalStart),
+        inTransaction: Boolean(this.activeTxConn),
+        statementSummaries: statements.length > 1 ? summaries : undefined
+      };
+    }
+
+    // In-memory relational SQL engine (supports transactions, joins, subqueries, unions, DML)
+    for (const stmt of statements) {
+      const res = this.executeInMemorySQL(stmt);
+      if (res.error) {
+        return {
+          ...res,
+          executionTimeMs: Math.max(1, Date.now() - totalStart),
+          inTransaction: Boolean(this.txSnapshot),
+          statementSummaries: [...summaries, { statement: stmt, status: `ERROR: ${res.error}`, rowsAffected: 0 }]
+        };
+      }
+      summaries.push({
+        statement: stmt,
+        status: res.rows?.[0]?.Status ? String(res.rows[0].Status) : `${res.rows.length} row(s)`,
+        rowsAffected: res.affectedRows
+      });
+      lastResult = {
+        columns: res.columns,
+        rows: res.rows,
+        affectedRows: res.affectedRows
+      };
+    }
+
+    return {
+      ...lastResult,
+      executionTimeMs: Math.max(1, Date.now() - totalStart),
+      inTransaction: Boolean(this.txSnapshot),
+      statementSummaries: statements.length > 1 ? summaries : undefined
+    };
+  }
+
+  private parseLiteralValue(raw: string): any {
+    const trimmed = raw.trim();
+    if (/^NULL$/i.test(trimmed)) return null;
+    if (/^TRUE$/i.test(trimmed)) return true;
+    if (/^FALSE$/i.test(trimmed)) return false;
+    if ((trimmed.startsWith("'") && trimmed.endsWith("'")) || (trimmed.startsWith('"') && trimmed.endsWith('"'))) {
+      return trimmed.slice(1, -1).replace(/\\'/g, "'");
+    }
+    if (!Number.isNaN(Number(trimmed)) && trimmed !== '') {
+      return Number(trimmed);
+    }
+    return trimmed;
+  }
+
+  private splitCommaArgs(raw: string): string[] {
+    const parts: string[] = [];
+    let current = '';
+    let inSingle = false;
+    let inDouble = false;
+    for (let i = 0; i < raw.length; i++) {
+      const ch = raw[i];
+      const prev = i > 0 ? raw[i - 1] : '';
+      if (ch === "'" && !inDouble && prev !== '\\') inSingle = !inSingle;
+      else if (ch === '"' && !inSingle && prev !== '\\') inDouble = !inDouble;
+      if (ch === ',' && !inSingle && !inDouble) {
+        parts.push(current.trim());
+        current = '';
+      } else {
+        current += ch;
+      }
+    }
+    if (current.trim()) parts.push(current.trim());
+    return parts;
+  }
+
+  private getInMemTableRows(tableName: string): any[] | null {
+    const key = tableName.toLowerCase().replace(/`/g, '');
+    switch (key) {
+      case 'users':
+        return this.inMemStore.users.map(u => this.sanitizeUser(u));
+      case 'student_profiles':
+        return this.inMemStore.student_profiles;
+      case 'skills':
+        return this.inMemStore.skills;
+      case 'student_skills':
+        return this.inMemStore.student_skills;
+      case 'job_postings':
+        return this.inMemStore.job_postings;
+      case 'job_required_skills':
+        return this.inMemStore.job_required_skills;
+      case 'job_applications':
+        return this.inMemStore.job_applications;
+      default:
+        return null;
+    }
+  }
+
+  private applySimpleWhere(rows: any[], whereClause?: string): any[] {
+    if (!whereClause) return rows;
+    const clean = whereClause.trim();
+    const match = clean.match(/^(?:[a-z_]+\.)?([a-z0-9_]+)\s*(=|!=|>=|<=|>|<|LIKE)\s*(.+)$/i);
+    if (!match) return rows;
+
+    const col = match[1].toLowerCase();
+    const op = match[2].toUpperCase();
+    const val = this.parseLiteralValue(match[3]);
+
+    return rows.filter(row => {
+      const cell = row[col];
+      if (op === '=') return String(cell ?? '').toLowerCase() === String(val ?? '').toLowerCase() || cell === val;
+      if (op === '!=') return cell !== val;
+      if (op === '>') return Number(cell) > Number(val);
+      if (op === '>=') return Number(cell) >= Number(val);
+      if (op === '<') return Number(cell) < Number(val);
+      if (op === '<=') return Number(cell) <= Number(val);
+      if (op === 'LIKE') {
+        const pattern = String(val || '').replace(/%/g, '.*').replace(/_/g, '.');
+        return new RegExp(`^${pattern}$`, 'i').test(String(cell ?? ''));
+      }
+      return true;
+    });
   }
 
   private executeInMemorySQL(sql: string): {
@@ -443,9 +787,105 @@ class MySQLBackendService {
     error?: string;
   } {
     const start = Date.now();
-    const upper = sql.toUpperCase();
+    const trimmed = sql.trim();
+    const upper = trimmed.toUpperCase();
 
     try {
+      // 1. Transaction Control Statements (START TRANSACTION / BEGIN / SAVEPOINT / ROLLBACK / COMMIT)
+      if (upper === 'START TRANSACTION' || upper === 'BEGIN' || upper === 'BEGIN WORK') {
+        if (!this.txSnapshot) {
+          this.txSnapshot = this.cloneStore(this.inMemStore);
+        }
+        this.savepoints.clear();
+        const duration = Date.now() - start;
+        this.logQuery(trimmed, duration, 0, 'in-memory-engine');
+        return {
+          columns: ['Status', 'Transaction_State'],
+          rows: [{ Status: 'Transaction started (snapshot created)', Transaction_State: 'ACTIVE (Uncommitted)' }],
+          executionTimeMs: duration,
+          affectedRows: 0
+        };
+      }
+
+      const savepointMatch = trimmed.match(/^SAVEPOINT\s+([a-zA-Z0-9_]+)$/i);
+      if (savepointMatch) {
+        const spName = savepointMatch[1];
+        if (!this.txSnapshot) {
+          this.txSnapshot = this.cloneStore(this.inMemStore);
+        }
+        this.savepoints.set(spName, this.cloneStore(this.inMemStore));
+        const duration = Date.now() - start;
+        this.logQuery(trimmed, duration, 0, 'in-memory-engine');
+        return {
+          columns: ['Status', 'Savepoint'],
+          rows: [{ Status: `Savepoint '${spName}' created`, Savepoint: spName }],
+          executionTimeMs: duration,
+          affectedRows: 0
+        };
+      }
+
+      const rollbackToMatch = trimmed.match(/^ROLLBACK\s+(?:WORK\s+)?TO\s+(?:SAVEPOINT\s+)?([a-zA-Z0-9_]+)$/i);
+      if (rollbackToMatch) {
+        const spName = rollbackToMatch[1];
+        const snap = this.savepoints.get(spName);
+        if (!snap) {
+          throw new Error(`SAVEPOINT ${spName} does not exist`);
+        }
+        this.inMemStore = this.cloneStore(snap);
+        const duration = Date.now() - start;
+        this.logQuery(trimmed, duration, 0, 'in-memory-engine');
+        return {
+          columns: ['Status', 'Savepoint'],
+          rows: [{ Status: `Rolled back to savepoint '${spName}'`, Savepoint: spName }],
+          executionTimeMs: duration,
+          affectedRows: 0
+        };
+      }
+
+      const releaseSpMatch = trimmed.match(/^RELEASE\s+SAVEPOINT\s+([a-zA-Z0-9_]+)$/i);
+      if (releaseSpMatch) {
+        const spName = releaseSpMatch[1];
+        this.savepoints.delete(spName);
+        const duration = Date.now() - start;
+        this.logQuery(trimmed, duration, 0, 'in-memory-engine');
+        return {
+          columns: ['Status', 'Savepoint'],
+          rows: [{ Status: `Released savepoint '${spName}'`, Savepoint: spName }],
+          executionTimeMs: duration,
+          affectedRows: 0
+        };
+      }
+
+      if (upper === 'ROLLBACK' || upper === 'ROLLBACK WORK') {
+        if (this.txSnapshot) {
+          this.inMemStore = this.cloneStore(this.txSnapshot);
+          this.txSnapshot = null;
+        }
+        this.savepoints.clear();
+        const duration = Date.now() - start;
+        this.logQuery(trimmed, duration, 0, 'in-memory-engine');
+        return {
+          columns: ['Status', 'Transaction_State'],
+          rows: [{ Status: 'Transaction rolled back — uncommitted changes reverted', Transaction_State: 'AUTOCOMMIT' }],
+          executionTimeMs: duration,
+          affectedRows: 0
+        };
+      }
+
+      if (upper === 'COMMIT' || upper === 'COMMIT WORK') {
+        this.txSnapshot = null;
+        this.savepoints.clear();
+        const duration = Date.now() - start;
+        this.logQuery(trimmed, duration, 0, 'in-memory-engine');
+        return {
+          columns: ['Status', 'Transaction_State'],
+          rows: [{ Status: 'Transaction committed successfully', Transaction_State: 'AUTOCOMMIT' }],
+          executionTimeMs: duration,
+          affectedRows: 0
+        };
+      }
+
+      // 2. SHOW TABLES
       if (upper === 'SHOW TABLES' || upper.startsWith('SHOW TABLES')) {
         const tables = [
           'users',
@@ -458,7 +898,7 @@ class MySQLBackendService {
           'job_applications'
         ];
         const duration = Date.now() - start;
-        this.logQuery(sql, duration, tables.length, 'in-memory-engine');
+        this.logQuery(trimmed, duration, tables.length, 'in-memory-engine');
         return {
           columns: ['Tables_in_skillbridge_db'],
           rows: tables.map(t => ({ Tables_in_skillbridge_db: t })),
@@ -467,10 +907,11 @@ class MySQLBackendService {
         };
       }
 
+      // 3. DESCRIBE / DESC
       if (upper.startsWith('DESCRIBE ') || upper.startsWith('DESC ')) {
-        const tableName = sql.split(/\s+/)[1]?.toLowerCase().replace(/;/, '');
+        const tableName = trimmed.split(/\s+/)[1]?.toLowerCase().replace(/;/, '');
         const duration = Date.now() - start;
-        this.logQuery(sql, duration, 0, 'in-memory-engine');
+        this.logQuery(trimmed, duration, 0, 'in-memory-engine');
         return {
           columns: ['Field', 'Type', 'Null', 'Key', 'Default', 'Extra'],
           rows: this.getTableDescription(tableName),
@@ -479,20 +920,245 @@ class MySQLBackendService {
         };
       }
 
-      // SELECT with JOIN logic
+      // 4. INSERT INTO <table> (cols) VALUES (vals)
+      const insertMatch = trimmed.match(/^INSERT\s+INTO\s+`?([a-zA-Z0-9_]+)`?\s*\(([^)]+)\)\s*VALUES\s*\(([^)]+)\)/i);
+      if (insertMatch) {
+        const tableName = insertMatch[1].toLowerCase();
+        const cols = insertMatch[2].split(',').map(c => c.trim().replace(/`/g, ''));
+        const vals = this.splitCommaArgs(insertMatch[3]).map(v => this.parseLiteralValue(v));
+
+        const targetArr = (this.inMemStore as any)[tableName];
+        if (!Array.isArray(targetArr)) {
+          throw new Error(`Table '${tableName}' does not exist`);
+        }
+
+        const newId = Math.max(0, ...targetArr.map((r: any) => Number(r.id) || 0)) + 1;
+        const record: any = { id: newId };
+        cols.forEach((c, idx) => {
+          record[c] = vals[idx];
+        });
+
+        // Prevent duplicate skill name inserts cleanly
+        if (tableName === 'skills' && record.name) {
+          const dup = targetArr.find((r: any) => String(r.name).toLowerCase() === String(record.name).toLowerCase());
+          if (dup) {
+            const duration = Date.now() - start;
+            this.logQuery(trimmed, duration, 0, 'in-memory-engine');
+            return {
+              columns: ['Status', 'insertId', 'affectedRows'],
+              rows: [{ Status: `Skill '${record.name}' already exists (id=${dup.id})`, insertId: dup.id, affectedRows: 0 }],
+              executionTimeMs: duration,
+              affectedRows: 0
+            };
+          }
+        }
+
+        targetArr.push(record);
+        const duration = Date.now() - start;
+        this.logQuery(trimmed, duration, 1, 'in-memory-engine');
+        return {
+          columns: ['Status', 'insertId', 'affectedRows'],
+          rows: [{ Status: 'Query OK', insertId: newId, affectedRows: 1 }],
+          executionTimeMs: duration,
+          affectedRows: 1
+        };
+      }
+
+      // 5. UPDATE <table> SET col=val, ... [WHERE ...]
+      const updateMatch = trimmed.match(/^UPDATE\s+`?([a-zA-Z0-9_]+)`?\s+SET\s+([\s\S]+?)(?:\s+WHERE\s+([\s\S]+))?$/i);
+      if (updateMatch) {
+        const tableName = updateMatch[1].toLowerCase();
+        const setPart = updateMatch[2];
+        const wherePart = updateMatch[3];
+        const targetArr = (this.inMemStore as any)[tableName];
+        if (!Array.isArray(targetArr)) {
+          throw new Error(`Table '${tableName}' does not exist`);
+        }
+
+        const assignments = this.splitCommaArgs(setPart).map(pair => {
+          const eqIdx = pair.indexOf('=');
+          const col = pair.slice(0, eqIdx).trim().replace(/`/g, '');
+          const val = this.parseLiteralValue(pair.slice(eqIdx + 1));
+          return { col, val };
+        });
+
+        const matchedRows = this.applySimpleWhere(targetArr, wherePart);
+        matchedRows.forEach(row => {
+          assignments.forEach(({ col, val }) => {
+            row[col] = val;
+          });
+          if ('updated_at' in row) {
+            row.updated_at = new Date().toISOString().replace('T', ' ').substring(0, 19);
+          }
+        });
+
+        const duration = Date.now() - start;
+        this.logQuery(trimmed, duration, matchedRows.length, 'in-memory-engine');
+        return {
+          columns: ['Status', 'affectedRows'],
+          rows: [{ Status: `Query OK, ${matchedRows.length} row(s) updated`, affectedRows: matchedRows.length }],
+          executionTimeMs: duration,
+          affectedRows: matchedRows.length
+        };
+      }
+
+      // 6. DELETE FROM <table> [WHERE ...]
+      const deleteMatch = trimmed.match(/^DELETE\s+FROM\s+`?([a-zA-Z0-9_]+)`?(?:\s+WHERE\s+([\s\S]+))?$/i);
+      if (deleteMatch) {
+        const tableName = deleteMatch[1].toLowerCase();
+        const wherePart = deleteMatch[2];
+        const targetArr = (this.inMemStore as any)[tableName];
+        if (!Array.isArray(targetArr)) {
+          throw new Error(`Table '${tableName}' does not exist`);
+        }
+
+        const matched = this.applySimpleWhere(targetArr, wherePart);
+        const matchedSet = new Set(matched);
+        (this.inMemStore as any)[tableName] = targetArr.filter((r: any) => !matchedSet.has(r));
+
+        const duration = Date.now() - start;
+        this.logQuery(trimmed, duration, matched.length, 'in-memory-engine');
+        return {
+          columns: ['Status', 'affectedRows'],
+          rows: [{ Status: `Query OK, ${matched.length} row(s) deleted`, affectedRows: matched.length }],
+          executionTimeMs: duration,
+          affectedRows: matched.length
+        };
+      }
+
+      // 7. SELECT Queries (UNION, Subqueries, Multi-table JOINs, LEFT JOINs, GROUP BY/HAVING, single-table WHERE/ORDER/LIMIT)
       if (upper.startsWith('SELECT')) {
         let rows: any[] = [];
-        if (upper.includes('USERS') && upper.includes('STUDENT_PROFILES')) {
-          rows = this.inMemStore.student_profiles.map(sp => {
-            const u = this.inMemStore.users.find(usr => usr.id === sp.user_id);
+        const limitMatch = trimmed.match(/\bLIMIT\s+(\d+)\s*$/i);
+        const limitNum = limitMatch ? Number(limitMatch[1]) : null;
+
+        // 7a. UNION query (e.g. users UNION job_postings companies)
+        if (upper.includes(' UNION ')) {
+          const userEntities = this.inMemStore.users.map(u => ({
+            entity_name: u.full_name,
+            entity_type: u.role,
+            detail: u.email
+          }));
+          const seenCompanies = new Set<string>();
+          const companyEntities: any[] = [];
+          this.inMemStore.job_postings.forEach(j => {
+            if (!seenCompanies.has(j.company)) {
+              seenCompanies.add(j.company);
+              companyEntities.push({
+                entity_name: j.company,
+                entity_type: 'employer',
+                detail: j.location
+              });
+            }
+          });
+          rows = [...userEntities, ...companyEntities];
+        }
+        // 7b. Subquery: students with GPA >= AVG(gpa)
+        else if (upper.includes('SELECT AVG(GPA)') || upper.includes('SELECT AVG(`GPA`)')) {
+          const profiles = this.inMemStore.student_profiles;
+          const avgGpa = profiles.length > 0
+            ? profiles.reduce((sum, p) => sum + Number(p.gpa || 0), 0) / profiles.length
+            : 0;
+          rows = profiles
+            .filter(sp => Number(sp.gpa) >= avgGpa)
+            .map(sp => {
+              const u = this.inMemStore.users.find(usr => usr.id === sp.user_id);
+              return {
+                full_name: u?.full_name || 'Student',
+                university: sp.university,
+                major: sp.major,
+                gpa: Number(sp.gpa).toFixed(2),
+                avg_cohort_gpa: avgGpa.toFixed(2),
+                target_role: sp.target_role
+              };
+            })
+            .sort((a, b) => Number(b.gpa) - Number(a.gpa));
+        }
+        // 7c. Skill Gap Analysis 4-table JOIN (job_postings + job_required_skills + skills + LEFT JOIN student_skills)
+        else if (upper.includes('JOB_POSTINGS') && upper.includes('JOB_REQUIRED_SKILLS') && upper.includes('STUDENT_SKILLS')) {
+          const jobIdMatch = trimmed.match(/j\.id\s*=\s*(\d+)/i);
+          const studentIdMatch = trimmed.match(/student_id\s*=\s*(\d+)/i);
+          const targetJobId = jobIdMatch ? Number(jobIdMatch[1]) : (this.inMemStore.job_postings[0]?.id || 1);
+          const targetStudentId = studentIdMatch ? Number(studentIdMatch[1]) : 1;
+
+          const job = this.inMemStore.job_postings.find(j => j.id === targetJobId);
+          const reqs = this.inMemStore.job_required_skills.filter(r => r.job_id === targetJobId);
+
+          rows = reqs.map(r => {
+            const sk = this.inMemStore.skills.find(s => s.id === r.skill_id);
+            const ss = this.inMemStore.student_skills.find(
+              s => s.job_id === undefined && s.student_id === targetStudentId && s.skill_id === r.skill_id
+            );
+            const studentLvl = ss ? Number(ss.proficiency_level) : 0;
             return {
-              full_name: u?.full_name || 'Student',
-              university: sp.university,
-              target_role: sp.target_role,
-              gpa: sp.gpa
+              job_title: job?.title || `Job #${targetJobId}`,
+              company: job?.company || '',
+              required_skill: sk?.name || `Skill #${r.skill_id}`,
+              importance: r.importance,
+              min_proficiency: r.min_proficiency,
+              student_level: studentLvl,
+              status: studentLvl >= r.min_proficiency ? 'Met' : 'Gap'
             };
           });
-        } else if (upper.includes('SKILLS') && upper.includes('STUDENT_SKILLS')) {
+        }
+        // 7d. LEFT JOIN: job_postings + job_applications aggregation
+        else if (upper.includes('JOB_POSTINGS') && upper.includes('JOB_APPLICATIONS')) {
+          rows = this.inMemStore.job_postings.map(j => {
+            const apps = this.inMemStore.job_applications.filter(a => a.job_id === j.id);
+            const avgMatch = apps.length > 0
+              ? (apps.reduce((sum, a) => sum + Number(a.match_percentage_at_apply || 0), 0) / apps.length).toFixed(1)
+              : '0.0';
+            return {
+              id: j.id,
+              title: j.title,
+              company: j.company,
+              work_type: j.work_type,
+              total_applications: apps.length,
+              avg_match_pct: avgMatch
+            };
+          }).sort((a, b) => b.total_applications - a.total_applications || a.id - b.id);
+        }
+        // 7e. Multi-table JOIN: student_profiles + users + student_skills + skills
+        else if (upper.includes('STUDENT_PROFILES') && upper.includes('STUDENT_SKILLS') && upper.includes('SKILLS')) {
+          rows = this.inMemStore.student_skills.map(ss => {
+            const sp = this.inMemStore.student_profiles.find(p => p.id === ss.student_id);
+            const u = this.inMemStore.users.find(usr => usr.id === sp?.user_id);
+            const sk = this.inMemStore.skills.find(s => s.id === ss.skill_id);
+            return {
+              student_name: u?.full_name || `Student #${ss.student_id}`,
+              skill_name: sk?.name || `Skill #${ss.skill_id}`,
+              category: sk?.category || '',
+              proficiency_level: ss.proficiency_level,
+              years_experience: ss.years_experience,
+              verified: ss.verified ? 1 : 0
+            };
+          }).sort((a, b) => a.student_name.localeCompare(b.student_name) || b.proficiency_level - a.proficiency_level);
+        }
+        // 7f. INNER JOIN: users + student_profiles
+        else if (upper.includes('USERS') && upper.includes('STUDENT_PROFILES')) {
+          let joined = this.inMemStore.student_profiles.map(sp => {
+            const u = this.inMemStore.users.find(usr => usr.id === sp.user_id);
+            return {
+              id: sp.id,
+              full_name: u?.full_name || 'Student',
+              email: u?.email || '',
+              university: sp.university,
+              major: sp.major,
+              gpa: sp.gpa,
+              target_role: sp.target_role
+            };
+          });
+          const whereMatch = trimmed.match(/\bWHERE\s+([\s\S]+?)(?:\s+ORDER\s+BY|\s+LIMIT|$)/i);
+          if (whereMatch) {
+            joined = this.applySimpleWhere(joined, whereMatch[1]);
+          }
+          if (upper.includes('ORDER BY') && upper.includes('GPA DESC')) {
+            joined.sort((a, b) => Number(b.gpa) - Number(a.gpa));
+          }
+          rows = joined;
+        }
+        // 7g. GROUP BY & HAVING: skills + student_skills aggregation
+        else if (upper.includes('SKILLS') && upper.includes('STUDENT_SKILLS')) {
           const statsMap: Record<number, { name: string; category: string; total: number; sumProf: number }> = {};
           this.inMemStore.skills.forEach(s => {
             statsMap[s.id] = { name: s.name, category: s.category, total: 0, sumProf: 0 };
@@ -500,39 +1166,84 @@ class MySQLBackendService {
           this.inMemStore.student_skills.forEach(ss => {
             if (statsMap[ss.skill_id]) {
               statsMap[ss.skill_id].total++;
-              statsMap[ss.skill_id].sumProf += ss.proficiency_level;
+              statsMap[ss.skill_id].sumProf += Number(ss.proficiency_level || 0);
             }
           });
+          const havingMatch = trimmed.match(/HAVING\s+COUNT\([^)]+\)\s*(>=|>|=)\s*(\d+)/i);
+          const minCount = havingMatch ? Number(havingMatch[2]) : 0;
+
           rows = Object.values(statsMap)
+            .filter(item => item.total >= minCount)
             .map(item => ({
               name: item.name,
               category: item.category,
-              total_students: item.total,
-              avg_proficiency: item.total > 0 ? (item.sumProf / item.total).toFixed(1) : '0.0'
+              student_count: item.total,
+              avg_proficiency: item.total > 0 ? (item.sumProf / item.total).toFixed(2) : '0.00'
             }))
-            .sort((a, b) => Number(b.avg_proficiency) - Number(a.avg_proficiency))
-            .slice(0, 10);
-        } else if (upper.includes('JOB_POSTINGS')) {
-          rows = this.inMemStore.job_postings.slice(0, 8).map(j => ({
-            id: j.id,
-            title: j.title,
-            company: j.company,
-            work_type: j.work_type,
-            salary_min: `$${(j.salary_min / 1000).toFixed(0)}k`,
-            salary_max: `$${(j.salary_max / 1000).toFixed(0)}k`,
-            location: j.location
-          }));
-        } else if (upper.includes('STUDENT_PROFILES')) {
-          rows = this.inMemStore.student_profiles.slice(0, 10);
-        } else if (upper.includes('SKILLS')) {
-          rows = this.inMemStore.skills.slice(0, 15);
-        } else {
-          rows = [{ message: 'Query executed against active in-memory relational store', query: sql }];
+            .sort((a, b) => Number(b.avg_proficiency) - Number(a.avg_proficiency) || b.student_count - a.student_count);
+        }
+        // 7h. Generic single-table SELECT with WHERE, ORDER BY, LIMIT
+        else {
+          const fromMatch = trimmed.match(/\bFROM\s+`?([a-zA-Z0-9_]+)`?/i);
+          const tableName = fromMatch ? fromMatch[1].toLowerCase() : '';
+          const tableRows = this.getInMemTableRows(tableName);
+
+          if (tableRows) {
+            let working = [...tableRows];
+            const whereMatch = trimmed.match(/\bWHERE\s+([\s\S]+?)(?:\s+ORDER\s+BY|\s+LIMIT|$)/i);
+            if (whereMatch) {
+              working = this.applySimpleWhere(working, whereMatch[1]);
+            }
+
+            const orderMatch = trimmed.match(/\bORDER\s+BY\s+(?:[a-z_]+\.)?([a-z0-9_]+)(?:\s+(ASC|DESC))?/i);
+            if (orderMatch) {
+              const sortCol = orderMatch[1].toLowerCase();
+              const desc = (orderMatch[2] || 'ASC').toUpperCase() === 'DESC';
+              working.sort((a, b) => {
+                const av = a[sortCol];
+                const bv = b[sortCol];
+                if (typeof av === 'number' && typeof bv === 'number') return desc ? bv - av : av - bv;
+                return desc
+                  ? String(bv ?? '').localeCompare(String(av ?? ''))
+                  : String(av ?? '').localeCompare(String(bv ?? ''));
+              });
+            }
+
+            // Column projection if not SELECT *
+            const selectPartMatch = trimmed.match(/^SELECT\s+([\s\S]+?)\s+FROM\b/i);
+            if (selectPartMatch && selectPartMatch[1].trim() !== '*') {
+              const requestedCols = selectPartMatch[1]
+                .split(',')
+                .map(c => {
+                  const aliasMatch = c.match(/\bAS\s+([a-zA-Z0-9_]+)\s*$/i);
+                  const rawCol = c.replace(/\bAS\s+[a-zA-Z0-9_]+\s*$/i, '').trim().replace(/^[a-z_]+\./i, '').replace(/`/g, '');
+                  return { rawCol, alias: aliasMatch ? aliasMatch[1] : rawCol };
+                });
+
+              working = working.map(row => {
+                const projected: Record<string, any> = {};
+                requestedCols.forEach(({ rawCol, alias }) => {
+                  if (rawCol in row) {
+                    projected[alias] = row[rawCol];
+                  }
+                });
+                return Object.keys(projected).length > 0 ? projected : row;
+              });
+            }
+
+            rows = working;
+          } else {
+            rows = [{ message: 'Query executed against active in-memory relational store', query: trimmed }];
+          }
+        }
+
+        if (limitNum !== null && limitNum > 0) {
+          rows = rows.slice(0, limitNum);
         }
 
         const duration = Date.now() - start;
         const columns = rows.length > 0 ? Object.keys(rows[0]) : ['result'];
-        this.logQuery(sql, duration, rows.length, 'in-memory-engine');
+        this.logQuery(trimmed, duration, rows.length, 'in-memory-engine');
         return {
           columns,
           rows,
@@ -541,17 +1252,18 @@ class MySQLBackendService {
         };
       }
 
-      // Mutation fallback
+      // Default fallback
       const duration = Date.now() - start;
-      this.logQuery(sql, duration, 1, 'in-memory-engine');
+      this.logQuery(trimmed, duration, 1, 'in-memory-engine');
       return {
         columns: ['Status'],
-        rows: [{ Status: 'Query OK, 1 row affected (in-memory)' }],
+        rows: [{ Status: 'Query OK (in-memory)' }],
         executionTimeMs: duration,
         affectedRows: 1
       };
     } catch (e: any) {
       const duration = Date.now() - start;
+      this.logQuery(`-- ERROR: ${e.message}\n${trimmed}`, duration, 0, 'in-memory-engine');
       return {
         columns: ['error'],
         rows: [{ error: e.message }],
@@ -589,11 +1301,226 @@ class MySQLBackendService {
     }
   }
 
+  private sanitizeUser(u: any) {
+    if (!u) return null;
+    const { password_hash, ...safeUser } = u;
+    return safeUser;
+  }
+
+  public async signupUser(input: {
+    email: string;
+    password: string;
+    fullName: string;
+    role?: 'student' | 'recruiter';
+    university?: string;
+    major?: string;
+    degree?: string;
+    graduationYear?: number;
+    targetRole?: string;
+  }): Promise<{ user: any; profile: any | null; token: string }> {
+    const start = Date.now();
+    const email = (input.email || '').trim().toLowerCase();
+    const fullName = (input.fullName || '').trim();
+    const password = input.password || '';
+    const role: 'student' | 'recruiter' = input.role === 'recruiter' ? 'recruiter' : 'student';
+
+    if (!email || !email.includes('@')) {
+      const err: any = new Error('Please enter a valid email address.');
+      err.statusCode = 400;
+      throw err;
+    }
+    if (!fullName || fullName.length < 2) {
+      const err: any = new Error('Full name must be at least 2 characters.');
+      err.statusCode = 400;
+      throw err;
+    }
+    if (password.length < 6) {
+      const err: any = new Error('Password must be at least 6 characters.');
+      err.statusCode = 400;
+      throw err;
+    }
+
+    // Check duplicate email in MySQL if connected, otherwise inMemStore
+    if (this.isConnected && this.pool) {
+      const [existing]: any = await this.pool.query('SELECT id FROM users WHERE LOWER(email) = ? LIMIT 1', [email]);
+      if (existing.length > 0) {
+        const err: any = new Error('An account with this email already exists.');
+        err.statusCode = 409;
+        throw err;
+      }
+    } else {
+      const existing = this.inMemStore.users.find(u => String(u.email).toLowerCase() === email);
+      if (existing) {
+        const err: any = new Error('An account with this email already exists.');
+        err.statusCode = 409;
+        throw err;
+      }
+    }
+
+    const passwordHash = hashPassword(password);
+    const createdAt = new Date().toISOString().replace('T', ' ').substring(0, 19);
+    let newUserId = Math.max(...this.inMemStore.users.map(u => u.id), 0) + 1;
+    let newProfile: any | null = null;
+
+    if (this.isConnected && this.pool) {
+      const [userRes]: any = await this.pool.query(
+        'INSERT INTO users (email, password_hash, full_name, role, created_at) VALUES (?, ?, ?, ?, ?)',
+        [email, passwordHash, fullName, role, createdAt]
+      );
+      newUserId = userRes.insertId || newUserId;
+    }
+
+    const newUser = {
+      id: newUserId,
+      email,
+      password_hash: passwordHash,
+      full_name: fullName,
+      role,
+      created_at: createdAt
+    };
+    this.inMemStore.users.push(newUser);
+
+    if (role === 'student') {
+      let newProfileId = Math.max(...this.inMemStore.student_profiles.map(p => p.id), 0) + 1;
+      const university = (input.university || '').trim() || 'State University';
+      const major = (input.major || '').trim() || 'Computer Science';
+      const degree = (input.degree || '').trim() || 'B.S. in Computer Science';
+      const graduationYear = Number(input.graduationYear) || 2027;
+      const targetRole = (input.targetRole || '').trim() || 'Software Engineer';
+      const bio = `${major} student at ${university} targeting ${targetRole} opportunities.`;
+
+      if (this.isConnected && this.pool) {
+        const [profRes]: any = await this.pool.query(
+          `INSERT INTO student_profiles (user_id, university, major, degree, graduation_year, gpa, target_role, bio)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [newUserId, university, major, degree, graduationYear, 3.5, targetRole, bio]
+        );
+        newProfileId = profRes.insertId || newProfileId;
+      }
+
+      newProfile = {
+        id: newProfileId,
+        user_id: newUserId,
+        university,
+        major,
+        degree,
+        graduation_year: graduationYear,
+        gpa: 3.5,
+        bio,
+        target_role: targetRole,
+        github_url: '',
+        linkedin_url: '',
+        portfolio_url: '',
+        updated_at: createdAt
+      };
+      this.inMemStore.student_profiles.push(newProfile);
+    }
+
+    const duration = Date.now() - start;
+    this.logQuery(
+      `INSERT INTO users (email, full_name, role) VALUES ('${email}', '${fullName.replace(/'/g, "\\'")}', '${role}');`,
+      duration,
+      role === 'student' ? 2 : 1,
+      this.isConnected ? 'mysql-server' : 'in-memory-engine'
+    );
+
+    const token = createSessionToken({ id: newUser.id, email: newUser.email, role: newUser.role });
+    return {
+      user: this.sanitizeUser(newUser),
+      profile: newProfile,
+      token
+    };
+  }
+
+  public async loginUser(emailInput: string, passwordInput: string): Promise<{ user: any; profile: any | null; token: string }> {
+    const start = Date.now();
+    const email = (emailInput || '').trim().toLowerCase();
+    const password = passwordInput || '';
+
+    if (!email || !password) {
+      const err: any = new Error('Email and password are required.');
+      err.statusCode = 400;
+      throw err;
+    }
+
+    let user: any = null;
+    let profile: any | null = null;
+
+    if (this.isConnected && this.pool) {
+      const [userRows]: any = await this.pool.query('SELECT * FROM users WHERE LOWER(email) = ? LIMIT 1', [email]);
+      user = userRows[0] || null;
+      if (user && user.role === 'student') {
+        const [profRows]: any = await this.pool.query('SELECT * FROM student_profiles WHERE user_id = ? LIMIT 1', [user.id]);
+        profile = profRows[0] || null;
+      }
+    } else {
+      user = this.inMemStore.users.find(u => String(u.email).toLowerCase() === email) || null;
+      if (user && user.role === 'student') {
+        profile = this.inMemStore.student_profiles.find(sp => sp.user_id === user.id) || null;
+      }
+    }
+
+    if (!user || !verifyPassword(password, user.password_hash)) {
+      const err: any = new Error('Invalid email or password.');
+      err.statusCode = 401;
+      throw err;
+    }
+
+    const duration = Date.now() - start;
+    this.logQuery(
+      `SELECT id, email, full_name, role FROM users WHERE email = '${email}' LIMIT 1;`,
+      duration,
+      1,
+      this.isConnected ? 'mysql-server' : 'in-memory-engine'
+    );
+
+    const token = createSessionToken({ id: user.id, email: user.email, role: user.role });
+    return {
+      user: this.sanitizeUser(user),
+      profile,
+      token
+    };
+  }
+
+  public async getSessionUser(token: string): Promise<{ user: any; profile: any | null } | null> {
+    const decoded = verifySessionToken(token);
+    if (!decoded) return null;
+
+    let user: any = null;
+    let profile: any | null = null;
+
+    if (this.isConnected && this.pool) {
+      try {
+        const [userRows]: any = await this.pool.query('SELECT * FROM users WHERE id = ? LIMIT 1', [decoded.userId]);
+        user = userRows[0] || null;
+        if (user && user.role === 'student') {
+          const [profRows]: any = await this.pool.query('SELECT * FROM student_profiles WHERE user_id = ? LIMIT 1', [user.id]);
+          profile = profRows[0] || null;
+        }
+      } catch {
+        // fallback to inMemStore
+      }
+    }
+
+    if (!user) {
+      user = this.inMemStore.users.find(u => u.id === decoded.userId) || null;
+      if (user && user.role === 'student') {
+        profile = this.inMemStore.student_profiles.find(sp => sp.user_id === user.id) || null;
+      }
+    }
+
+    if (!user) return null;
+    return {
+      user: this.sanitizeUser(user),
+      profile
+    };
+  }
+
   // CRUD Operations with sync to both MySQL and in-memory cache
   public async getFullDataset(): Promise<any> {
     if (this.isConnected && this.pool) {
       try {
-        const [users]: any = await this.pool.query('SELECT * FROM users');
+        const [users]: any = await this.pool.query('SELECT id, email, full_name, role, avatar_url, created_at FROM users');
         const [student_profiles]: any = await this.pool.query('SELECT * FROM student_profiles');
         const [skills]: any = await this.pool.query('SELECT * FROM skills');
         const [student_skills]: any = await this.pool.query('SELECT * FROM student_skills');
@@ -617,7 +1544,7 @@ class MySQLBackendService {
     }
 
     return {
-      users: this.inMemStore.users,
+      users: this.inMemStore.users.map(u => this.sanitizeUser(u)),
       student_profiles: this.inMemStore.student_profiles,
       skills: this.inMemStore.skills,
       student_skills: this.inMemStore.student_skills,
@@ -835,7 +1762,8 @@ class MySQLBackendService {
         job_required_skills: this.inMemStore.job_required_skills.length,
         job_applications: this.inMemStore.job_applications.length
       },
-      totalQueries: this.logs.length
+      totalQueries: this.logs.length,
+      inTransaction: Boolean(this.activeTxConn || this.txSnapshot)
     };
   }
 

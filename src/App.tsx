@@ -19,7 +19,8 @@ import { SkillGapAnalyzer } from './components/SkillGapAnalyzer';
 import { EmployerPortal } from './components/EmployerPortal';
 import { MySQLStudio } from './components/MySQLStudio';
 import { StudentProfileModal } from './components/StudentProfileModal';
-import { apiClient, BackendStatus } from './lib/api-client';
+import { AuthPage } from './components/AuthPage';
+import { apiClient, AuthResponse, BackendStatus } from './lib/api-client';
 
 export default function App() {
   // Database state mirrored from mysqlEngine & MySQL backend
@@ -35,9 +36,14 @@ export default function App() {
   const [backendStatus, setBackendStatus] = useState<BackendStatus | null>(null);
   const [isInitialized, setIsInitialized] = useState<boolean>(false);
 
+  // Authentication State
+  const [authChecked, setAuthChecked] = useState<boolean>(false);
+  const [authenticatedUser, setAuthenticatedUser] = useState<UserRecord | null>(null);
+  const [authenticatedProfile, setAuthenticatedProfile] = useState<StudentProfileRecord | null>(null);
+
   // App UI State
   const [activeTab, setActiveTab] = useState<'recommendations' | 'skills' | 'gap-analyzer' | 'employer' | 'mysql-studio'>('recommendations');
-  const [activeStudentId, setActiveStudentId] = useState<number>(1);
+  const [activeStudentId, setActiveStudentId] = useState<number>(0);
   const [selectedJobMatch, setSelectedJobMatch] = useState<RecommendationMatchResult | null>(null);
   const [isProfileModalOpen, setIsProfileModalOpen] = useState<boolean>(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
@@ -92,13 +98,34 @@ export default function App() {
     }
   }, []);
 
-  // Initialize engine and subscribe to updates
+  // Initialize engine, check existing auth session, and subscribe to updates
   useEffect(() => {
     let mounted = true;
     async function init() {
       await mysqlEngine.initFromFirestore();
       if (!mounted) return;
       refreshStateFromEngine();
+
+      const storedToken = apiClient.getStoredToken();
+      if (storedToken) {
+        const session = await apiClient.getSession(storedToken);
+        if (mounted && session?.user) {
+          mysqlEngine.upsertUserAndProfile(session.user, session.profile);
+          setAuthenticatedUser(session.user);
+          setAuthenticatedProfile(session.profile);
+          if (session.profile) {
+            setActiveStudentId(session.profile.id);
+          }
+          if (session.user.role === 'recruiter') {
+            setActiveTab('employer');
+          }
+        } else if (mounted) {
+          apiClient.clearStoredToken();
+        }
+      }
+
+      if (!mounted) return;
+      setAuthChecked(true);
       setIsInitialized(true);
       await fetchBackendData();
     }
@@ -123,14 +150,44 @@ export default function App() {
     }, 3500);
   };
 
-  // Active student and user record
+  const handleAuthSuccess = (auth: AuthResponse) => {
+    mysqlEngine.upsertUserAndProfile(auth.user, auth.profile);
+    setAuthenticatedUser(auth.user);
+    setAuthenticatedProfile(auth.profile);
+    if (auth.profile) {
+      setActiveStudentId(auth.profile.id);
+    } else {
+      setActiveStudentId(0);
+    }
+    setActiveTab(auth.user.role === 'recruiter' ? 'employer' : 'recommendations');
+    fetchBackendData();
+    showToast(`Welcome, ${auth.user.full_name}!`);
+  };
+
+  const handleLogout = async () => {
+    await apiClient.logout();
+    setAuthenticatedUser(null);
+    setAuthenticatedProfile(null);
+    setActiveStudentId(0);
+    setSelectedJobMatch(null);
+    setIsProfileModalOpen(false);
+  };
+
+  // Active student and user record strictly bound to authenticated account
   const currentStudent = useMemo(() => {
-    return students.find(s => s.id === activeStudentId) || students[0];
-  }, [students, activeStudentId]);
+    if (!authenticatedUser || authenticatedUser.role === 'recruiter') return null;
+    return (
+      students.find(s => s.id === activeStudentId) ||
+      students.find(s => s.user_id === authenticatedUser.id) ||
+      authenticatedProfile ||
+      null
+    );
+  }, [students, activeStudentId, authenticatedUser, authenticatedProfile]);
 
   const currentUser = useMemo(() => {
-    return users.find(u => u.id === currentStudent?.user_id) || users[0];
-  }, [users, currentStudent]);
+    if (!authenticatedUser) return null;
+    return users.find(u => u.id === authenticatedUser.id) || authenticatedUser;
+  }, [users, authenticatedUser]);
 
   // Active student's skills
   const currentStudentSkills = useMemo(() => {
@@ -191,6 +248,7 @@ export default function App() {
   const handleSaveProfile = (data: Partial<StudentProfileRecord>) => {
     if (!currentStudent) return;
     mysqlEngine.updateStudentProfile(currentStudent.id, data);
+    setAuthenticatedProfile(prev => (prev ? { ...prev, ...data } : prev));
     apiClient.updateStudentProfile(currentStudent.id, data)
       .catch(err => console.warn('Backend sync error:', err));
     showToast('Updated student profile and career targets in MySQL database.');
@@ -206,16 +264,20 @@ export default function App() {
     showToast(`New role "${jobData.title}" published! Automatic matching initialized.`);
   };
 
-  if (!isInitialized || !currentStudent || !currentUser) {
+  if (!isInitialized || !authChecked) {
     return (
       <div className="min-h-screen bg-slate-50 flex items-center justify-center">
         <div className="text-center space-y-4">
           <div className="w-12 h-12 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin mx-auto" />
           <p className="text-sm font-bold text-slate-700">Connecting to MySQL Relational Engine...</p>
-          <p className="text-xs text-slate-400">Loading student profiles, verified skills, and job catalogs</p>
+          <p className="text-xs text-slate-400">Verifying session and loading SkillBridge catalog</p>
         </div>
       </div>
     );
+  }
+
+  if (!currentUser) {
+    return <AuthPage onAuthSuccess={handleAuthSuccess} />;
   }
 
   return (
@@ -224,18 +286,16 @@ export default function App() {
       <Header
         activeTab={activeTab}
         setActiveTab={setActiveTab}
-        students={students}
-        users={users}
-        activeStudentId={activeStudentId}
-        setActiveStudentId={setActiveStudentId}
+        currentUser={currentUser}
+        currentStudent={currentStudent}
         onEditProfile={() => setIsProfileModalOpen(true)}
-        isCloudSynced={isCloudSynced}
+        onLogout={handleLogout}
         backendStatus={backendStatus}
       />
 
       {/* Main Content Area */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-8">
-        {activeTab === 'recommendations' && (
+        {activeTab === 'recommendations' && currentStudent && (
           <RecommendationDashboard
             student={currentStudent}
             user={currentUser}
@@ -246,7 +306,7 @@ export default function App() {
           />
         )}
 
-        {activeTab === 'skills' && (
+        {activeTab === 'skills' && currentStudent && (
           <SkillInventory
             student={currentStudent}
             studentSkills={currentStudentSkills}
@@ -258,7 +318,7 @@ export default function App() {
           />
         )}
 
-        {activeTab === 'gap-analyzer' && (
+        {activeTab === 'gap-analyzer' && currentStudent && (
           <SkillGapAnalyzer
             student={currentStudent}
             studentSkills={currentStudentSkills}
@@ -309,7 +369,7 @@ export default function App() {
       </footer>
 
       {/* Job Detail & AI Advisor Modal */}
-      {selectedJobMatch && (
+      {selectedJobMatch && currentStudent && (
         <JobDetailModal
           matchResult={selectedJobMatch}
           student={currentStudent}
@@ -320,7 +380,7 @@ export default function App() {
       )}
 
       {/* Student Profile Editor Modal */}
-      {isProfileModalOpen && (
+      {isProfileModalOpen && currentStudent && (
         <StudentProfileModal
           student={currentStudent}
           user={currentUser}

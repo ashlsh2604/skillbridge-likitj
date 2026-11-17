@@ -28,33 +28,156 @@ interface MySQLStudioProps {
   onRefreshData?: () => void;
 }
 
-const PRESET_QUERIES = [
+type PresetCategory = 'All' | 'Joins' | 'Transactions' | 'Aggregations & Subqueries' | 'DML & Schema';
+
+interface QueryPreset {
+  name: string;
+  category: Exclude<PresetCategory, 'All'>;
+  sql: string;
+}
+
+const PRESET_CATEGORIES: PresetCategory[] = [
+  'All',
+  'Joins',
+  'Transactions',
+  'Aggregations & Subqueries',
+  'DML & Schema'
+];
+
+const PRESET_QUERIES: QueryPreset[] = [
   {
-    name: 'Top Students & Career Targets',
-    sql: 'SELECT u.full_name, sp.university, sp.target_role, sp.gpa FROM users u JOIN student_profiles sp ON u.id = sp.user_id;'
+    name: 'INNER JOIN: Students & Profiles',
+    category: 'Joins',
+    sql: `SELECT u.id, u.full_name, sp.university, sp.major, sp.target_role, sp.gpa
+FROM users u
+INNER JOIN student_profiles sp ON u.id = sp.user_id
+ORDER BY sp.gpa DESC;`
   },
   {
-    name: 'Skill Popularity & Avg Proficiency',
-    sql: 'SELECT s.name, s.category, count(ss.id) as total_students, avg(ss.proficiency_level) as avg_proficiency FROM skills s JOIN student_skills ss ON s.id = ss.skill_id GROUP BY s.id ORDER BY avg_proficiency DESC LIMIT 6;'
+    name: 'Multi-Table JOIN: Skill Matrix',
+    category: 'Joins',
+    sql: `SELECT u.full_name, sp.target_role, s.name AS skill_name, s.category, ss.proficiency_level, ss.years_experience
+FROM student_profiles sp
+JOIN users u ON sp.user_id = u.id
+JOIN student_skills ss ON sp.id = ss.student_id
+JOIN skills s ON ss.skill_id = s.id
+WHERE ss.proficiency_level >= 4
+ORDER BY ss.proficiency_level DESC
+LIMIT 12;`
   },
   {
-    name: 'Job Postings & Requirements Count',
-    sql: 'SELECT j.title, j.company, j.work_type, j.salary_min, j.salary_max FROM job_postings j LIMIT 6;'
+    name: 'LEFT JOIN: Jobs & Applications',
+    category: 'Joins',
+    sql: `SELECT j.id, j.title, j.company, j.work_type, COUNT(ja.id) AS total_applications
+FROM job_postings j
+LEFT JOIN job_applications ja ON j.id = ja.job_id
+GROUP BY j.id
+ORDER BY total_applications DESC;`
   },
   {
-    name: 'Inspect Table Schema',
+    name: '4-Table Skill Gap JOIN',
+    category: 'Joins',
+    sql: `SELECT j.title, j.company, s.name AS required_skill, jrs.importance, jrs.min_proficiency, COALESCE(ss.proficiency_level, 0) AS student_level
+FROM job_postings j
+JOIN job_required_skills jrs ON j.id = jrs.job_id
+JOIN skills s ON jrs.skill_id = s.id
+LEFT JOIN student_skills ss ON s.id = ss.skill_id AND ss.student_id = 1
+ORDER BY j.id, jrs.importance;`
+  },
+  {
+    name: 'Transaction + ROLLBACK Demo',
+    category: 'Transactions',
+    sql: `START TRANSACTION;
+UPDATE student_profiles SET gpa = 4.00, target_role = 'Principal Architect' WHERE id = 1;
+ROLLBACK;
+SELECT id, university, gpa, target_role FROM student_profiles WHERE id = 1;`
+  },
+  {
+    name: 'SAVEPOINT + ROLLBACK TO + COMMIT',
+    category: 'Transactions',
+    sql: `START TRANSACTION;
+INSERT INTO skills (name, category, description) VALUES ('Rust', 'Languages', 'Systems programming with memory safety');
+SAVEPOINT sp_after_skill;
+UPDATE student_profiles SET target_role = 'Temporary Draft Role' WHERE id = 1;
+ROLLBACK TO SAVEPOINT sp_after_skill;
+COMMIT;
+SELECT id, name, category, description FROM skills WHERE name = 'Rust';`
+  },
+  {
+    name: 'START TRANSACTION (Open Session)',
+    category: 'Transactions',
+    sql: `START TRANSACTION;
+UPDATE student_profiles SET gpa = 3.99 WHERE id = 1;
+SELECT id, university, gpa, target_role FROM student_profiles WHERE id = 1;`
+  },
+  {
+    name: 'COMMIT (Persist Active Tx)',
+    category: 'Transactions',
+    sql: `COMMIT;
+SELECT id, university, gpa, target_role FROM student_profiles WHERE id = 1;`
+  },
+  {
+    name: 'ROLLBACK (Revert Active Tx)',
+    category: 'Transactions',
+    sql: `ROLLBACK;
+SELECT id, university, gpa, target_role FROM student_profiles WHERE id = 1;`
+  },
+  {
+    name: 'GROUP BY & HAVING: Skill Demand',
+    category: 'Aggregations & Subqueries',
+    sql: `SELECT s.name, s.category, COUNT(ss.id) AS total_students, AVG(ss.proficiency_level) AS avg_proficiency
+FROM skills s
+JOIN student_skills ss ON s.id = ss.skill_id
+GROUP BY s.id
+HAVING COUNT(ss.id) >= 2
+ORDER BY avg_proficiency DESC;`
+  },
+  {
+    name: 'Subquery: Above-Avg GPA Students',
+    category: 'Aggregations & Subqueries',
+    sql: `SELECT u.full_name, sp.university, sp.major, sp.gpa
+FROM student_profiles sp
+JOIN users u ON sp.user_id = u.id
+WHERE sp.gpa >= (SELECT AVG(gpa) FROM student_profiles)
+ORDER BY sp.gpa DESC;`
+  },
+  {
+    name: 'UNION: Students & Employers',
+    category: 'Aggregations & Subqueries',
+    sql: `SELECT full_name AS entity_name, role AS entity_type, email AS detail FROM users
+UNION
+SELECT company AS entity_name, 'employer' AS entity_type, title AS detail FROM job_postings;`
+  },
+  {
+    name: 'INSERT + SELECT Skill Row',
+    category: 'DML & Schema',
+    sql: `INSERT INTO skills (name, category, description) VALUES ('GraphQL', 'Backend', 'Typed API query language and runtime');
+SELECT id, name, category, description FROM skills WHERE name = 'GraphQL';`
+  },
+  {
+    name: 'DELETE Skill Cleanup',
+    category: 'DML & Schema',
+    sql: `DELETE FROM skills WHERE name = 'GraphQL';
+SELECT id, name, category FROM skills ORDER BY id DESC LIMIT 6;`
+  },
+  {
+    name: 'DESCRIBE student_profiles',
+    category: 'DML & Schema',
     sql: 'DESCRIBE student_profiles;'
   },
   {
-    name: 'Show All Tables',
+    name: 'SHOW TABLES',
+    category: 'DML & Schema',
     sql: 'SHOW TABLES;'
   }
 ];
 
 export const MySQLStudio: React.FC<MySQLStudioProps> = ({ logs, backendStatus, onRefreshData }) => {
   const [activeTab, setActiveTab] = useState<'console' | 'schema' | 'logs' | 'config'>('console');
+  const [presetCategory, setPresetCategory] = useState<PresetCategory>('All');
   const [queryInput, setQueryInput] = useState<string>(PRESET_QUERIES[0].sql);
   const [isRunningQuery, setIsRunningQuery] = useState<boolean>(false);
+  const [inTransaction, setInTransaction] = useState<boolean>(Boolean(backendStatus?.inTransaction));
   const [queryResult, setQueryResult] = useState<SQLQueryResult | null>(() => {
     return mysqlEngine.executeQuery(PRESET_QUERIES[0].sql);
   });
@@ -72,34 +195,43 @@ export const MySQLStudio: React.FC<MySQLStudioProps> = ({ logs, backendStatus, o
   const [isReseeding, setIsReseeding] = useState(false);
   const [connectionFeedback, setConnectionFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
-  const handleRunQuery = async () => {
-    if (!queryInput.trim()) return;
+  const visiblePresets = presetCategory === 'All'
+    ? PRESET_QUERIES
+    : PRESET_QUERIES.filter(p => p.category === presetCategory);
+
+  const runSQLStatement = async (sqlToRun: string) => {
+    if (!sqlToRun.trim()) return;
     setIsRunningQuery(true);
     try {
-      const res = await apiClient.executeQuery(queryInput);
+      const res = await apiClient.executeQuery(sqlToRun);
       setQueryResult(res);
+      if (typeof res.inTransaction === 'boolean') {
+        setInTransaction(res.inTransaction);
+      }
       onRefreshData?.();
     } catch {
-      const fallback = mysqlEngine.executeQuery(queryInput);
+      const fallback = mysqlEngine.executeQuery(sqlToRun);
       setQueryResult(fallback);
+      if (typeof fallback.inTransaction === 'boolean') {
+        setInTransaction(fallback.inTransaction);
+      }
     } finally {
       setIsRunningQuery(false);
     }
   };
 
+  const handleRunQuery = async () => {
+    await runSQLStatement(queryInput);
+  };
+
   const handleSelectPreset = async (sql: string) => {
     setQueryInput(sql);
-    setIsRunningQuery(true);
-    try {
-      const res = await apiClient.executeQuery(sql);
-      setQueryResult(res);
-      onRefreshData?.();
-    } catch {
-      const fallback = mysqlEngine.executeQuery(sql);
-      setQueryResult(fallback);
-    } finally {
-      setIsRunningQuery(false);
-    }
+    await runSQLStatement(sql);
+  };
+
+  const handleQuickTransactionAction = async (statement: 'START TRANSACTION;' | 'COMMIT;' | 'ROLLBACK;') => {
+    setQueryInput(statement);
+    await runSQLStatement(statement);
   };
 
   const handleTestConnect = async (e: React.FormEvent) => {
@@ -135,6 +267,7 @@ export const MySQLStudio: React.FC<MySQLStudioProps> = ({ logs, backendStatus, o
     setConnectionFeedback(null);
     try {
       await apiClient.reseedDatabase();
+      setInTransaction(false);
       setConnectionFeedback({
         type: 'success',
         message: 'Successfully re-seeded MySQL tables with default datasets!'
@@ -181,24 +314,26 @@ export const MySQLStudio: React.FC<MySQLStudioProps> = ({ logs, backendStatus, o
     { name: 'job_applications', desc: 'Submitted student job applications and statuses' }
   ];
 
+  const rowCountDisplay = queryResult ? (queryResult.rowCount ?? queryResult.rows.length) : 0;
+
   return (
     <div className="space-y-6" id="mysql-studio-root">
       {/* Studio Header */}
       <div className="bg-slate-900 text-white rounded-2xl p-6 shadow-sm border border-slate-800">
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 flex items-center justify-center font-bold">
+            <div className="w-10 h-10 rounded-xl bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 flex items-center justify-center font-bold shrink-0">
               <Database className="w-5 h-5" />
             </div>
             <div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <h2 className="text-xl font-bold tracking-tight">MySQL Relational Database Studio</h2>
-                <span className="px-2 py-0.5 text-xs font-semibold rounded bg-emerald-950 text-emerald-400 border border-emerald-800">
+                <span className="px-2 py-0.5 text-xs font-semibold rounded bg-emerald-950 text-emerald-400 border border-emerald-800 whitespace-nowrap shrink-0">
                   Engine: InnoDB • 8.0+
                 </span>
               </div>
               <p className="text-xs text-slate-400 mt-0.5">
-                Direct relational table management, live SQL query console, schema ERD, and production DDL export.
+                Direct relational table management, multi-statement SQL transactions, joins, schema ERD, and DDL export.
               </p>
             </div>
           </div>
@@ -206,14 +341,14 @@ export const MySQLStudio: React.FC<MySQLStudioProps> = ({ logs, backendStatus, o
           <div className="flex items-center gap-2">
             <button
               onClick={handleDownloadDump}
-              className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 transition shadow-2xs"
+              className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 transition shadow-2xs whitespace-nowrap shrink-0 cursor-pointer"
             >
               <Download className="w-3.5 h-3.5" />
               <span>Export .sql Dump</span>
             </button>
             <button
               onClick={handleCopyDump}
-              className="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition border border-slate-700"
+              className="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition border border-slate-700 whitespace-nowrap shrink-0 cursor-pointer"
             >
               {copiedDump ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
               <span>{copiedDump ? 'Copied DDL' : 'Copy DDL'}</span>
@@ -222,10 +357,10 @@ export const MySQLStudio: React.FC<MySQLStudioProps> = ({ logs, backendStatus, o
         </div>
 
         {/* Tab Controls */}
-        <div className="flex items-center gap-2 mt-6 pt-4 border-t border-slate-800">
+        <div className="flex flex-wrap items-center gap-2 mt-6 pt-4 border-t border-slate-800">
           <button
             onClick={() => setActiveTab('console')}
-            className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition ${
+            className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition whitespace-nowrap shrink-0 cursor-pointer ${
               activeTab === 'console'
                 ? 'bg-emerald-500 text-slate-950'
                 : 'text-slate-400 hover:text-white hover:bg-slate-800'
@@ -237,7 +372,7 @@ export const MySQLStudio: React.FC<MySQLStudioProps> = ({ logs, backendStatus, o
 
           <button
             onClick={() => setActiveTab('schema')}
-            className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition ${
+            className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition whitespace-nowrap shrink-0 cursor-pointer ${
               activeTab === 'schema'
                 ? 'bg-emerald-500 text-slate-950'
                 : 'text-slate-400 hover:text-white hover:bg-slate-800'
@@ -249,7 +384,7 @@ export const MySQLStudio: React.FC<MySQLStudioProps> = ({ logs, backendStatus, o
 
           <button
             onClick={() => setActiveTab('logs')}
-            className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition ${
+            className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition whitespace-nowrap shrink-0 cursor-pointer ${
               activeTab === 'logs'
                 ? 'bg-emerald-500 text-slate-950'
                 : 'text-slate-400 hover:text-white hover:bg-slate-800'
@@ -261,7 +396,7 @@ export const MySQLStudio: React.FC<MySQLStudioProps> = ({ logs, backendStatus, o
 
           <button
             onClick={() => setActiveTab('config')}
-            className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition ${
+            className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition whitespace-nowrap shrink-0 cursor-pointer ${
               activeTab === 'config'
                 ? 'bg-emerald-500 text-slate-950'
                 : 'text-slate-400 hover:text-white hover:bg-slate-800'
@@ -277,16 +412,31 @@ export const MySQLStudio: React.FC<MySQLStudioProps> = ({ logs, backendStatus, o
       {activeTab === 'console' && (
         <div className="space-y-4">
           <div className="bg-white rounded-xl border border-slate-200 p-4 space-y-3">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-bold text-slate-700">Quick Query Presets</span>
-              <span className="text-[11px] text-slate-400">Click to load and execute</span>
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <span className="text-xs font-bold text-slate-700">SQL Query Library ({visiblePresets.length})</span>
+              <div className="flex flex-wrap items-center gap-1.5">
+                {PRESET_CATEGORIES.map(cat => (
+                  <button
+                    key={cat}
+                    onClick={() => setPresetCategory(cat)}
+                    className={`px-2.5 py-1 text-[11px] font-semibold rounded-md transition whitespace-nowrap shrink-0 cursor-pointer ${
+                      presetCategory === cat
+                        ? 'bg-slate-900 text-white'
+                        : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                    }`}
+                  >
+                    {cat}
+                  </button>
+                ))}
+              </div>
             </div>
+
             <div className="flex flex-wrap gap-2">
-              {PRESET_QUERIES.map(pq => (
+              {visiblePresets.map(pq => (
                 <button
                   key={pq.name}
                   onClick={() => handleSelectPreset(pq.sql)}
-                  className="px-2.5 py-1 text-xs rounded-lg bg-slate-100 hover:bg-indigo-50 hover:text-indigo-700 text-slate-700 border border-slate-200 transition font-medium"
+                  className="px-2.5 py-1.5 text-xs rounded-lg bg-slate-50 hover:bg-indigo-50 hover:text-indigo-700 text-slate-700 border border-slate-200 transition font-medium whitespace-nowrap shrink-0 cursor-pointer"
                 >
                   {pq.name}
                 </button>
@@ -295,27 +445,63 @@ export const MySQLStudio: React.FC<MySQLStudioProps> = ({ logs, backendStatus, o
           </div>
 
           <div className="bg-slate-950 rounded-xl border border-slate-800 overflow-hidden shadow-sm">
-            <div className="px-4 py-2 bg-slate-900 border-b border-slate-800 flex items-center justify-between">
-              <div className="flex items-center gap-2 text-xs text-slate-400">
-                <Terminal className="w-3.5 h-3.5 text-emerald-400" />
-                <span>mysql&gt; Query Editor (skillbridge_db)</span>
+            <div className="px-4 py-2.5 bg-slate-900 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2.5 text-xs text-slate-400">
+                <Terminal className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                <span className="font-mono">mysql&gt; Query Editor (skillbridge_db)</span>
+                <span
+                  className={`px-2 py-0.5 rounded text-[11px] font-mono font-semibold whitespace-nowrap shrink-0 ${
+                    inTransaction
+                      ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
+                      : 'bg-slate-800 text-slate-300 border border-slate-700'
+                  }`}
+                >
+                  {inTransaction ? 'IN TRANSACTION' : 'AUTOCOMMIT'}
+                </span>
               </div>
-              <button
-                onClick={handleRunQuery}
-                disabled={isRunningQuery}
-                className="px-3 py-1 bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-bold text-xs rounded flex items-center gap-1.5 transition cursor-pointer"
-              >
-                {isRunningQuery ? (
-                  <RefreshCw className="w-3 h-3 animate-spin text-slate-950" />
-                ) : (
-                  <Play className="w-3 h-3 fill-slate-950" />
-                )}
-                <span>{isRunningQuery ? 'Running...' : 'Execute SQL'}</span>
-              </button>
+
+              <div className="flex flex-wrap items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => handleQuickTransactionAction('START TRANSACTION;')}
+                  disabled={isRunningQuery}
+                  className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-200 border border-slate-700 font-mono text-[11px] rounded transition whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  START TRANSACTION
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleQuickTransactionAction('COMMIT;')}
+                  disabled={isRunningQuery}
+                  className="px-2.5 py-1 bg-slate-800 hover:bg-emerald-900/60 disabled:opacity-50 text-emerald-300 border border-slate-700 font-mono text-[11px] rounded transition whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  COMMIT
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleQuickTransactionAction('ROLLBACK;')}
+                  disabled={isRunningQuery}
+                  className="px-2.5 py-1 bg-slate-800 hover:bg-rose-900/60 disabled:opacity-50 text-rose-300 border border-slate-700 font-mono text-[11px] rounded transition whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  ROLLBACK
+                </button>
+                <button
+                  onClick={handleRunQuery}
+                  disabled={isRunningQuery}
+                  className="px-3 py-1 bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-bold text-xs rounded flex items-center gap-1.5 transition whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  {isRunningQuery ? (
+                    <RefreshCw className="w-3 h-3 animate-spin text-slate-950" />
+                  ) : (
+                    <Play className="w-3 h-3 fill-slate-950" />
+                  )}
+                  <span>{isRunningQuery ? 'Running...' : 'Execute SQL'}</span>
+                </button>
+              </div>
             </div>
 
             <textarea
-              rows={3}
+              rows={6}
               value={queryInput}
               onChange={(e) => setQueryInput(e.target.value)}
               className="w-full bg-slate-950 text-emerald-300 font-mono text-xs sm:text-sm p-4 outline-none resize-y border-none"
@@ -326,15 +512,49 @@ export const MySQLStudio: React.FC<MySQLStudioProps> = ({ logs, backendStatus, o
           {/* Query Results */}
           {queryResult && (
             <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-2xs space-y-0">
-              <div className="p-3 bg-slate-50 border-b border-slate-200 flex items-center justify-between text-xs text-slate-600">
+              <div className="p-3 bg-slate-50 border-b border-slate-200 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-600">
                 <div className="flex items-center gap-2">
                   <span className="font-bold text-slate-800">Result Set</span>
-                  <span className="px-2 py-0.5 rounded bg-slate-200 font-mono text-[11px]">
-                    {queryResult.rowCount} rows returned in {queryResult.executionTimeMs}ms
+                  <span className="px-2 py-0.5 rounded bg-slate-200 font-mono text-[11px] tabular-nums">
+                    {rowCountDisplay} {rowCountDisplay === 1 ? 'row' : 'rows'} returned in {queryResult.executionTimeMs}ms
                   </span>
+                  {queryResult.affectedRows > 0 && (
+                    <span className="px-2 py-0.5 rounded bg-emerald-100 text-emerald-800 font-mono text-[11px] tabular-nums">
+                      {queryResult.affectedRows} affected
+                    </span>
+                  )}
                 </div>
-                <span className="text-[11px] text-slate-400 font-mono">STATUS: 200 OK</span>
+                <span className="text-[11px] text-slate-500 font-mono">
+                  {queryResult.error ? 'STATUS: ERROR' : 'STATUS: 200 OK'}
+                </span>
               </div>
+
+              {queryResult.statementSummaries && queryResult.statementSummaries.length > 1 && (
+                <div className="px-3 py-2.5 bg-slate-900 border-b border-slate-800 space-y-1.5">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+                    Statement Execution Trace ({queryResult.statementSummaries.length} statements)
+                  </div>
+                  <div className="grid grid-cols-1 gap-1 font-mono text-[11px]">
+                    {queryResult.statementSummaries.map((step, idx) => (
+                      <div key={idx} className="flex items-center justify-between gap-3 px-2.5 py-1 rounded bg-slate-950/80 border border-slate-800">
+                        <span className="text-slate-300 truncate">
+                          <span className="text-slate-500 mr-2">#{idx + 1}</span>
+                          {step.statement}
+                        </span>
+                        <span className={`shrink-0 tabular-nums ${
+                          step.status.startsWith('ERROR')
+                            ? 'text-rose-400'
+                            : step.status.includes('ROLLED BACK')
+                              ? 'text-amber-300'
+                              : 'text-emerald-400'
+                        }`}>
+                          {step.status} ({step.rowsAffected})
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {queryResult.error ? (
                 <div className="p-4 bg-red-50 text-red-700 text-xs font-mono">
@@ -386,9 +606,9 @@ export const MySQLStudio: React.FC<MySQLStudioProps> = ({ logs, backendStatus, o
                     key={t.name}
                     onClick={() => {
                       setSelectedTable(t.name);
-                      setQueryResult(mysqlEngine.executeQuery(`DESCRIBE ${t.name};`));
+                      runSQLStatement(`DESCRIBE ${t.name};`);
                     }}
-                    className={`w-full text-left p-2 rounded-lg text-xs font-mono flex items-center justify-between transition ${
+                    className={`w-full text-left p-2 rounded-lg text-xs font-mono flex items-center justify-between transition cursor-pointer ${
                       selectedTable === t.name
                         ? 'bg-indigo-50 text-indigo-700 font-bold border border-indigo-200'
                         : 'text-slate-700 hover:bg-slate-100'
@@ -412,11 +632,12 @@ export const MySQLStudio: React.FC<MySQLStudioProps> = ({ logs, backendStatus, o
                 </div>
                 <button
                   onClick={() => {
-                    const res = mysqlEngine.executeQuery(`SELECT * FROM ${selectedTable} LIMIT 10;`);
-                    setQueryResult(res);
+                    const sql = `SELECT * FROM ${selectedTable} LIMIT 10;`;
+                    setQueryInput(sql);
                     setActiveTab('console');
+                    runSQLStatement(sql);
                   }}
-                  className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold rounded-lg transition"
+                  className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold rounded-lg transition whitespace-nowrap shrink-0 cursor-pointer"
                 >
                   View Table Data
                 </button>
@@ -459,14 +680,14 @@ export const MySQLStudio: React.FC<MySQLStudioProps> = ({ logs, backendStatus, o
         <div className="bg-slate-950 rounded-xl border border-slate-800 p-4 space-y-3 font-mono text-xs">
           <div className="flex items-center justify-between text-slate-400 border-b border-slate-800 pb-2">
             <span>MySQL General Query Audit Log</span>
-            <span>{logs.length} Recent Statements</span>
+            <span className="tabular-nums">{logs.length} Recent Statements</span>
           </div>
           <div className="space-y-2 max-h-96 overflow-y-auto">
             {logs.map(log => (
               <div key={log.id} className="p-2.5 rounded bg-slate-900/90 border border-slate-800 flex items-start gap-3">
-                <span className="text-slate-500 text-[11px] shrink-0">{log.timestamp}</span>
+                <span className="text-slate-500 text-[11px] shrink-0 tabular-nums">{log.timestamp}</span>
                 <span className="text-emerald-400 flex-1 break-all">{log.query}</span>
-                <span className="text-slate-400 text-[11px] shrink-0">{log.executionTimeMs}ms</span>
+                <span className="text-slate-400 text-[11px] shrink-0 tabular-nums">{log.executionTimeMs}ms</span>
               </div>
             ))}
           </div>
@@ -490,19 +711,19 @@ export const MySQLStudio: React.FC<MySQLStudioProps> = ({ logs, backendStatus, o
               </div>
 
               <div className="flex items-center gap-3">
-                <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold ${
+                <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold whitespace-nowrap shrink-0 ${
                   backendStatus?.connected
                     ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
                     : 'bg-indigo-50 text-indigo-700 border border-indigo-200'
                 }`}>
-                  <span className={`w-2 h-2 rounded-full ${backendStatus?.connected ? 'bg-emerald-500 animate-pulse' : 'bg-indigo-500'}`}></span>
+                  <span className={`w-2 h-2 rounded-full ${backendStatus?.connected ? 'bg-emerald-500' : 'bg-indigo-500'}`}></span>
                   <span>{backendStatus?.connected ? 'Live MySQL Instance Connected' : 'Relational Engine Active'}</span>
                 </span>
 
                 <button
                   onClick={handleReseed}
                   disabled={isReseeding}
-                  className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-700 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer"
+                  className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-700 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer whitespace-nowrap shrink-0"
                   title="Reseed tables with default student, skill, and job records"
                 >
                   <RefreshCw className={`w-3.5 h-3.5 ${isReseeding ? 'animate-spin' : ''}`} />

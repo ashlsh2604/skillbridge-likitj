@@ -19,6 +19,7 @@ export interface BackendStatus {
   error?: string;
   tableCounts: Record<string, number>;
   totalQueries: number;
+  inTransaction?: boolean;
 }
 
 export interface SQLLog {
@@ -30,11 +31,20 @@ export interface SQLLog {
   source: 'mysql-server' | 'in-memory-engine';
 }
 
+export interface SQLStatementSummary {
+  statement: string;
+  status: string;
+  rowsAffected: number;
+}
+
 export interface SQLQueryResult {
   columns: string[];
   rows: any[];
+  rowCount?: number;
   executionTimeMs: number;
   affectedRows: number;
+  inTransaction?: boolean;
+  statementSummaries?: SQLStatementSummary[];
   error?: string;
 }
 
@@ -50,7 +60,106 @@ export interface FullDatasetResponse {
   status?: BackendStatus;
 }
 
+export interface AuthResponse {
+  user: UserRecord;
+  profile: StudentProfileRecord | null;
+  token: string;
+}
+
+export interface SignupPayload {
+  email: string;
+  password: string;
+  fullName: string;
+  role: 'student' | 'recruiter';
+  university?: string;
+  major?: string;
+  degree?: string;
+  graduationYear?: number;
+  targetRole?: string;
+}
+
+const AUTH_TOKEN_STORAGE_KEY = 'skillbridge_auth_token';
+
 class APIClient {
+  public getStoredToken(): string | null {
+    try {
+      return localStorage.getItem(AUTH_TOKEN_STORAGE_KEY);
+    } catch {
+      return null;
+    }
+  }
+
+  public setStoredToken(token: string): void {
+    try {
+      localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, token);
+    } catch {
+      // ignore storage errors
+    }
+  }
+
+  public clearStoredToken(): void {
+    try {
+      localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+    } catch {
+      // ignore storage errors
+    }
+  }
+
+  public async login(email: string, password: string): Promise<AuthResponse> {
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.error || 'Invalid email or password.');
+    }
+    if (data.token) {
+      this.setStoredToken(data.token);
+    }
+    return data;
+  }
+
+  public async signup(payload: SignupPayload): Promise<AuthResponse> {
+    const res = await fetch('/api/auth/signup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.error || 'Could not create account.');
+    }
+    if (data.token) {
+      this.setStoredToken(data.token);
+    }
+    return data;
+  }
+
+  public async getSession(token: string): Promise<{ user: UserRecord; profile: StudentProfileRecord | null } | null> {
+    try {
+      const res = await fetch('/api/auth/me', {
+        headers: {
+          Authorization: `Bearer ${token}`
+        }
+      });
+      if (!res.ok) return null;
+      return await res.json();
+    } catch {
+      return null;
+    }
+  }
+
+  public async logout(): Promise<void> {
+    this.clearStoredToken();
+    try {
+      await fetch('/api/auth/logout', { method: 'POST' });
+    } catch {
+      // ignore
+    }
+  }
+
   public async getFullDataset(): Promise<FullDatasetResponse | null> {
     try {
       const res = await fetch('/api/data');

@@ -40,6 +40,50 @@ app.get('/api/health', (req: Request, res: Response) => {
   });
 });
 
+// Authentication: Sign Up
+app.post('/api/auth/signup', async (req: Request, res: Response) => {
+  try {
+    const result = await mysqlBackend.signupUser(req.body || {});
+    res.status(201).json(result);
+  } catch (err: any) {
+    res.status(err.statusCode || 500).json({ error: err.message || 'Sign-up failed' });
+  }
+});
+
+// Authentication: Login
+app.post('/api/auth/login', async (req: Request, res: Response) => {
+  try {
+    const { email, password } = req.body || {};
+    const result = await mysqlBackend.loginUser(email, password);
+    res.json(result);
+  } catch (err: any) {
+    res.status(err.statusCode || 500).json({ error: err.message || 'Login failed' });
+  }
+});
+
+// Authentication: Current Session
+app.get('/api/auth/me', async (req: Request, res: Response) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    if (!token) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+    const session = await mysqlBackend.getSessionUser(token);
+    if (!session) {
+      return res.status(401).json({ error: 'Session expired or invalid' });
+    }
+    res.json(session);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Session verification failed' });
+  }
+});
+
+// Authentication: Logout
+app.post('/api/auth/logout', (req: Request, res: Response) => {
+  res.json({ success: true });
+});
+
 // MySQL Backend Status
 app.get('/api/mysql/status', (req: Request, res: Response) => {
   res.json(mysqlBackend.getStatus());
